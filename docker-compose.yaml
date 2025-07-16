@@ -1,0 +1,53 @@
+services:
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
+    container_name: wireguard
+    hostname: wireguard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${CONFIG_DIR}/wireguard:/config
+      - ${CONFIG_DIR}/wireguard_startup:/custom-cont-init.d:ro
+      - /lib/modules:/lib/modules
+    ports:
+      - 8080:80
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    healthcheck:
+      test: ping -c 1 1.1.1.1 || exit 1
+      interval: 2s
+      start_period: 10s
+      start_interval: 2s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+  speedtest-tracker:
+    image: lscr.io/linuxserver/speedtest-tracker:latest
+    restart: unless-stopped
+    container_name: speedtest-tracker
+    network_mode: service:wireguard
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - APP_KEY=${APP_KEY}
+      - DB_CONNECTION=sqlite
+      - SPEEDTEST_SCHEDULE="*/10 * * * *"
+      - DISPLAY_TIMEZONE=${TZ}
+    volumes:
+      - ${CONFIG_DIR}/speedtest-tracker:/config
+    healthcheck:
+      test: curl -fSs http://localhost/api/healthcheck | jq -r .message || exit 1
+      interval: 10s
+      retries: 3
+      start_period: 30s
+      timeout: 10s
+    depends_on:
+      wireguard:
+        condition: service_healthy
+
