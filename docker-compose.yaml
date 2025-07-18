@@ -50,4 +50,3 @@ services:
     depends_on:
       wireguard:
         condition: service_healthy
-
