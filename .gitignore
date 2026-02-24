@@ -1,7 +1,9 @@
 # WireGuard generated configs and keys
-configs/wireguard/wg_confs/
+configs/wireguard/wg_confs/*
+!configs/wireguard/wg_confs/wg0.conf
 configs/wireguard/server/
 configs/wireguard/peer_*/
+!configs/wireguard/peer_example/
 configs/wireguard/coredns/
 configs/wireguard/templates/
 
