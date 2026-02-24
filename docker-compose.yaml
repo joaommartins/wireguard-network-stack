@@ -5,48 +5,185 @@ services:
     hostname: wireguard
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
+      - PEERS=${WIREGUARD_PEERS}
+      - SERVERURL=${WIREGUARD_SERVERURL}
+      - SERVERPORT=${WIREGUARD_PORT}
+      - INTERNAL_SUBNET=10.0.2.0/24
+      - PEERDNS=10.0.2.1
+      - ALLOWEDIPS=0.0.0.0/0
+      - LOG_CONFS=false
+    healthcheck:
+      test: ping -c 1 1.1.1.1 || exit 1
+      interval: 2s
+      start_period: 10s
+      start_interval: 2s  # requires Docker Compose v2.20+ / Docker Engine 25+
+      timeout: 5s
+      retries: 3
     volumes:
       - ${CONFIG_DIR}/wireguard:/config
       - ${CONFIG_DIR}/wireguard_startup:/custom-cont-init.d:ro
-      - /lib/modules:/lib/modules
     ports:
-      - 8080:80
+      - 80:80
+      - 443:443
+      - ${WIREGUARD_PORT}:${WIREGUARD_PORT}/udp
+      - ${JELLYFIN_WEBUI_HTTP_PORT}:${JELLYFIN_WEBUI_HTTP_PORT}  # direct access for Jellyfin mobile apps
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
+    networks:
+      - default
+      - internal
+    restart: always
+    labels:
+      - traefik.enable=true
+      ## PiHole
+      - traefik.http.routers.pihole.entrypoints=websecure
+      - traefik.http.routers.pihole.rule=Host(`pihole.${DOMAIN}`)
+      - traefik.http.routers.pihole.service=pihole
+      - traefik.http.services.pihole.loadbalancer.server.scheme=http
+      - traefik.http.services.pihole.loadbalancer.server.port=${PIHOLE_WEBUI_PORT}
+      ## Jellyfin
+      - traefik.http.routers.jellyfin.entrypoints=websecure
+      - traefik.http.routers.jellyfin.rule=Host(`jellyfin.${DOMAIN}`)
+      - traefik.http.routers.jellyfin.tls.certresolver=letsencrypt
+      - traefik.http.routers.jellyfin.service=jellyfin
+      - traefik.http.services.jellyfin.loadbalancer.server.scheme=http
+      - traefik.http.services.jellyfin.loadbalancer.server.port=${JELLYFIN_WEBUI_HTTP_PORT}
+
+  pihole:
+    container_name: pihole
+    image: pihole/pihole:latest
+    network_mode: service:wireguard
+    depends_on:
+      wireguard:
+        condition: service_healthy
     healthcheck:
-      test: ping -c 1 1.1.1.1 || exit 1
+      test: ping -c 1 google.com || exit 1
       interval: 2s
       start_period: 10s
       start_interval: 2s
       timeout: 5s
       retries: 3
-    restart: unless-stopped
-  speedtest-tracker:
-    image: lscr.io/linuxserver/speedtest-tracker:latest
-    restart: unless-stopped
-    container_name: speedtest-tracker
+    environment:
+      TZ: ${TZ}
+      FTLCONF_webserver_port: ${PIHOLE_WEBUI_PORT}
+      FTLCONF_webserver_api_password: ${PIHOLE_PASSWORD}
+      FTLCONF_dns_upstreams: '1.1.1.1'
+      FTLCONF_dns_dnssec: true
+      FTLCONF_dns_revServers: 'true,192.168.1.0/24,192.168.1.1,lan'
+      FTLCONF_misc_dnsmasq_lines: "address=/${DOMAIN}/10.0.2.1"
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ${CONFIG_DIR}/pihole/etc-pihole/:/etc/pihole/
+      - ${CONFIG_DIR}/pihole/etc-dnsmasq.d/:/etc/dnsmasq.d/
+    restart: always
+
+  proxy:
+    image: tecnativa/docker-socket-proxy
+    container_name: proxy
+    environment:
+      - CONTAINERS=1
+      - SERVICES=1
+      - NETWORKS=1
+      - TASKS=1
+      - IMAGES=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - internal
+    restart: always
+
+  traefik:
+    image: traefik
+    container_name: traefik
+    network_mode: service:wireguard
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ${CONFIG_DIR}/traefik/letsencrypt:/letsencrypt
+    command:
+      - --api.dashboard=true
+      - --certificatesresolvers.letsencrypt.acme.dnschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.dnschallenge.provider=cloudflare
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.endpoint=tcp://proxy:2375
+      - --entrypoints.websecure.http.tls=true
+      - --entrypoints.websecure.http.tls.certResolver=letsencrypt
+      - --entrypoints.websecure.http.tls.domains[0].main=${DOMAIN}
+      - --entrypoints.websecure.http.tls.domains[0].sans=*.${DOMAIN}
+      - --log.level=INFO
+    environment:
+      - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
+    depends_on:
+      pihole:
+        condition: service_healthy
+      proxy:
+        condition: service_started
+    restart: always
+
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin
+    container_name: jellyfin
     network_mode: service:wireguard
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
-      - APP_KEY=${APP_KEY}
-      - DB_CONNECTION=sqlite
-      - SPEEDTEST_SCHEDULE="*/10 * * * *"
-      - DISPLAY_TIMEZONE=${TZ}
+      - JELLYFIN_PublishedServerUrl=jellyfin.${DOMAIN}
     volumes:
-      - ${CONFIG_DIR}/speedtest-tracker:/config
-    healthcheck:
-      test: curl -fSs http://localhost/api/healthcheck | jq -r .message || exit 1
-      interval: 10s
-      retries: 3
-      start_period: 30s
-      timeout: 10s
+      - ${CONFIG_DIR}/jellyfin:/config
+      - ${MOVIE_BACKUPS_DIR}:/data/movie_backups
+    devices:
+      - /dev/dri:/dev/dri
     depends_on:
-      wireguard:
+      pihole:
         condition: service_healthy
+    restart: always
+
+  ntfy:
+    image: binwiederhier/ntfy
+    container_name: ntfy
+    command:
+      - serve
+    environment:
+      - TZ=${TZ}
+      - NTFY_BASE_URL=https://ntfy.${DOMAIN}
+      - NTFY_AUTH_DEFAULT_ACCESS=deny-all
+      - NTFY_BEHIND_PROXY=true
+      - NTFY_ENABLE_LOGIN=true
+    user: ${PUID}:${PGID}
+    volumes:
+      - ${CONFIG_DIR}/ntfy_cache:/var/lib/ntfy
+      - ${CONFIG_DIR}/ntfy_config:/etc/ntfy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --tries=1 http://localhost:80/v1/health -O - | grep -Eo '\"healthy\"\\s*:\\s*true' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.ntfy.entrypoints=websecure
+      - traefik.http.routers.ntfy.rule=Host(`ntfy.${DOMAIN}`)
+      - traefik.http.routers.ntfy.tls.certresolver=letsencrypt
+      - traefik.http.routers.ntfy.service=ntfy
+      - traefik.http.services.ntfy.loadbalancer.server.scheme=http
+      - traefik.http.services.ntfy.loadbalancer.server.port=80
+    restart: always
+
+networks:
+  default:
+    name: docker-stack-network
+  internal:
+    name: traefik-internal
+    internal: true

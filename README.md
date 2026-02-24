@@ -1,81 +1,187 @@
 # WireGuard Network Stack
 
-This repository is an example setup for running a WireGuard VPN server and a client container sharing its network stack using Docker Compose. It includes a `speedtest-tracker` container that operates within the WireGuard network.
+A Docker Compose stack that runs WireGuard as both a Mullvad VPN client and a WireGuard server, with PiHole for ad-blocking DNS, Traefik as an HTTPS reverse proxy, and services that can selectively bypass the kill switch.
 
-## Features
+For a full walkthrough, see the accompanying blog post: [Running WireGuard as Client and Server in Docker with PiHole and Traefik](https://jmartins.dev/posts/wireguard-docker-vpn-server).
 
-- **WireGuard VPN**: A secure VPN server configured with Docker.
-- **Shared Network Stack**: The `speedtest-tracker` container shares the WireGuard container's network stack.
-- **Health Checks**: Both containers include health checks to ensure proper operation.
-- **Customizable Configuration**: Environment variables and configuration files allow for easy customization.
+## Architecture
 
-## Repository Structure
+The WireGuard container sits at the centre of the stack, running two interfaces simultaneously:
 
-- `docker-compose.yaml`: Defines the services and their configurations.
-- `.env`: Contains environment variables for customization.
-- `configs/wireguard/wg_confs/wg0.conf`: WireGuard client configuration file.
+- **`wg0`** — Server interface accepting connections from remote peers (laptop, phone, etc.)
+- **`wg1`** — Client interface tunnelling outbound traffic through Mullvad VPN
 
-## Setup Instructions
+PiHole and Traefik share the WireGuard container's network namespace via `network_mode: service:wireguard`. Remote clients connect through `wg0`, get ad-blocking DNS from PiHole, HTTPS routing from Traefik, and all outbound traffic exits through the Mullvad tunnel on `wg1`.
+
+A kill switch blocks all outbound traffic if the VPN connection drops. Services that need to maintain connectivity regardless of VPN state (e.g. ntfy for push notifications) run on their own Docker network, bypassing the kill switch.
+
+## Services
+
+| Service | Role | Network |
+|---------|------|---------|
+| **WireGuard** | VPN client + server | Own namespace (both networks) |
+| **PiHole** | Ad-blocking DNS, custom domain resolution | Shares WireGuard's namespace |
+| **Traefik** | HTTPS reverse proxy with Let's Encrypt wildcard certs | Shares WireGuard's namespace |
+| **Docker Socket Proxy** | Restricted Docker API access for Traefik | Internal network only |
+| **Jellyfin** | Media server (example: behind kill switch) | Shares WireGuard's namespace |
+| **ntfy** | Push notifications (example: outside kill switch) | Default network |
+
+## Setup
 
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/your-repo/wireguard-network-stack.git
+git clone https://github.com/joaommartins/wireguard-network-stack.git
 cd wireguard-network-stack
 ```
 
 ### 2. Configure Environment Variables
 
-Edit the `.env` file to set your desired values for `PUID`, `PGID`, `TZ`, and `CONFIG_DIR`.
-
-### 3. Generate Sensitive Data
-
-#### Regenerate the Private Key
-
-The private key in `wg0.conf` is redacted for security. You must generate a new private key:
+Copy and edit the `.env` file with your values:
 
 ```bash
-wg genkey | tee privatekey | wg pubkey > publickey
+cp .env .env.local  # optional: keep the original as reference
 ```
 
-- Replace the `[redacted]` value in `wg0.conf` with the contents of the `privatekey` file.
-- Use the `publickey` file to configure peers.
+Key variables to set:
 
-#### Generate a New `APP_KEY`
+| Variable | Description |
+|----------|-------------|
+| `CONFIG_DIR` | Path to store all service configuration data |
+| `MOVIE_BACKUPS_DIR` | Path to media files for Jellyfin |
+| `DOMAIN` | Your domain (e.g. `example.com`) — used for Traefik routing and PiHole DNS |
+| `WIREGUARD_PEERS` | Comma-separated list of peer names (e.g. `laptop,phone`) |
+| `WIREGUARD_SERVERURL` | Public hostname or IP for WireGuard server |
+| `PIHOLE_PASSWORD` | PiHole admin interface password |
+| `ACME_EMAIL` | Email for Let's Encrypt certificate registration |
+| `CF_DNS_API_TOKEN` | Cloudflare API token for DNS-01 challenge |
 
-The `APP_KEY` in `.env` is used by the `speedtest-tracker` container. Regenerate it using:
+### 3. Add Your Mullvad Configuration
+
+Place your Mullvad WireGuard client configuration at `${CONFIG_DIR}/wireguard/wg1.conf`:
+
+```ini
+[Interface]
+PrivateKey = <your-mullvad-private-key>
+Address = <your-mullvad-address>/32
+DNS = 127.0.0.1
+
+[Peer]
+PublicKey = <mullvad-server-public-key>
+AllowedIPs = 0.0.0.0/0
+Endpoint = <mullvad-server-endpoint>:51820
+```
+
+Note: `DNS` is set to `127.0.0.1` so the container's own DNS queries go through PiHole.
+
+### 4. Start the Stack
 
 ```bash
-echo -n 'base64:'; openssl rand -base64 32
+docker compose up -d
 ```
 
-Replace the existing `APP_KEY` value in `.env` with the new one.
+On first run, the Linuxserver.io WireGuard image generates the server configuration (`wg0.conf`) and peer configurations in `${CONFIG_DIR}/wireguard/peer_*/`.
 
-### 4. Start the Services
+### 5. Configure the Server Interface
 
-Run the following command to start the containers:
+After the first run, edit `${CONFIG_DIR}/wireguard/wg_confs/wg0.conf` to add forwarding and NAT rules:
+
+```ini
+[Interface]
+Address = 10.0.2.1
+ListenPort = 51820
+PrivateKey = <generated-private-key>
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE
+FwMark = 51820
+
+[Peer] # peer_laptop
+PublicKey = <generated-public-key>
+AllowedIPs = 10.0.2.2/32
+```
+
+The `PostUp` rules enable packet forwarding and NAT so peer traffic exits through the Mullvad tunnel. `FwMark = 51820` exempts the server's own encrypted packets from the kill switch.
+
+Then restart the stack:
 
 ```bash
-docker-compose up -d
+docker compose restart wireguard
 ```
 
-### 5. Verify Health Checks
+### 6. Connect Your Devices
 
-Ensure both services are running and healthy:
+Import the generated peer configuration from `${CONFIG_DIR}/wireguard/peer_<name>/peer_<name>.conf` on your device, or scan the QR code PNG with the WireGuard mobile app.
+
+## Kill Switch
+
+The startup script (`configs/wireguard_startup/iptables.sh`) installs iptables rules that:
+
+1. Allow traffic to RFC 1918 private address ranges via the default gateway
+2. Block all outbound traffic not going through `wg1`, not marked with `0xca6c` (port 51820 in hex), and not destined for a local address
+3. Bring up the Mullvad client interface (`wg1`)
+
+If the VPN connection drops, all outbound traffic for services sharing WireGuard's network is blocked. Services on their own Docker network (like ntfy) are unaffected.
+
+## Adding Services
+
+### Behind the kill switch
+
+Use `network_mode: service:wireguard` and add Traefik labels to the **wireguard** container:
+
+```yaml
+  my-service:
+    image: my-image
+    network_mode: service:wireguard
+    depends_on:
+      pihole:
+        condition: service_healthy
+    restart: always
+```
+
+Then add labels on the wireguard service and expose the port:
+
+```yaml
+  # On the wireguard service:
+  ports:
+    - <port>:<port>
+  labels:
+    - traefik.http.routers.my-service.entrypoints=websecure
+    - traefik.http.routers.my-service.rule=Host(`my-service.${DOMAIN}`)
+    - traefik.http.routers.my-service.service=my-service
+    - traefik.http.services.my-service.loadbalancer.server.port=<port>
+```
+
+### Outside the kill switch
+
+Give the service its own network and define labels on its own container:
+
+```yaml
+  my-service:
+    image: my-image
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.my-service.entrypoints=websecure
+      - traefik.http.routers.my-service.rule=Host(`my-service.${DOMAIN}`)
+      - traefik.http.routers.my-service.tls.certresolver=letsencrypt
+      - traefik.http.routers.my-service.service=my-service
+      - traefik.http.services.my-service.loadbalancer.server.port=<port>
+    restart: always
+```
+
+## Verification
+
+From a connected device:
 
 ```bash
-docker compose ps
+# Confirm traffic exits through Mullvad
+curl https://am.i.mullvad.net/connected
+
+# Verify PiHole resolves your domain to the tunnel address
+dig +short jellyfin.example.com @10.0.2.1
+
+# Test HTTPS routing through Traefik
+curl -sI https://jellyfin.example.com
 ```
-
-### 6. Access the Services
-
-- **Speedtest Tracker**: Access the web interface at `http://localhost:8080`.
-
-## Notes
-
-- The `speedtest-tracker` container uses the `network_mode: service:wireguard` setting to share the WireGuard container's network stack.
-- The `wg0.conf` file must be updated with the correct private key and peer information before use.
 
 ## License
 
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

@@ -1,1 +1,22 @@
-./configs/speedtest-tracker/
+# WireGuard generated configs and keys
+configs/wireguard/wg_confs/
+configs/wireguard/server/
+configs/wireguard/peer_*/
+configs/wireguard/coredns/
+configs/wireguard/templates/
+
+# PiHole data
+configs/pihole/
+
+# Traefik certificates
+configs/traefik/
+
+# Jellyfin config
+configs/jellyfin/
+
+# ntfy data
+configs/ntfy_cache/
+configs/ntfy_config/
+
+# Speedtest tracker (legacy)
+configs/speedtest-tracker/
